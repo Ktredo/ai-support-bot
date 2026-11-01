@@ -1,6 +1,6 @@
 # qdrant_rag.py
 import os
-import re  # <--- ДОБАВЛЕН ИМПОРТ
+import re 
 import uuid
 import logging
 from qdrant_client import QdrantClient
@@ -42,26 +42,35 @@ class QdrantRAGEngine:
         with open(self.txt_path, "r", encoding="utf-8") as f:
             text = f.read()
 
-        # Разбиваем по предложениям
-        sentences = re.split(r'(?<=[.!?]) +', text)
+        # Разделяем текст на блоки по пустым строкам (двойной перенос)
+        # Это идеально работает и для "ВОПРОС-ОТВЕТ", и для обычных фактов
+        blocks = re.split(r'\n\s*\n', text)
         
         chunks = []
-        current_chunk = ""
-        
-        for sentence in sentences:
-            if len(sentence) > 1000:
-                sentence = sentence[:1000]
-                
-            if len(current_chunk) + len(sentence) < 400:
-                current_chunk += sentence + " "
-            else:
-                if len(current_chunk) > 50:
-                    chunks.append(current_chunk.strip())
-                current_chunk = sentence + " "
-                
-        if current_chunk and len(current_chunk) > 50:
-            chunks.append(current_chunk.strip())
+        for block in blocks:
+            block = block.strip()
+            if not block or len(block) < 50: 
+                continue
             
+            # Если блок получился слишком огромным (например, сплошной текст без абзацев)
+            # То режем его по предложениям
+            if len(block) > 1000:
+                sentences = re.split(r'(?<=[.!?]) +', block)
+                current_chunk = ""
+                for sentence in sentences:
+                    if len(current_chunk) + len(sentence) < 800:
+                        current_chunk += sentence + " "
+                    else:
+                        if len(current_chunk.strip()) > 50:
+                            chunks.append(current_chunk.strip())
+                        current_chunk = sentence + " "
+                if len(current_chunk.strip()) > 50:
+                    chunks.append(current_chunk.strip())
+            else:
+                # Если блок нормального размера (один вопрос-ответ или один факт) — берем целиком
+                chunks.append(block)
+
+        logger.info(f"Нарезано {len(chunks)} кусков (Q&A и факты).")
         return chunks
 
     def _index_data(self):

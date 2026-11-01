@@ -10,25 +10,29 @@ class FactAuditor:
         self.ollama_url = ollama_url
         self.model_name = model_name
 
-    def audit(self, client_answer: str, context_text: str) -> tuple[bool, str]:
-        prompt = AUDITOR_PROMPT.format(context_text=context_text, client_answer=client_answer)
+    # ДОБАВЛЕН АРГУМЕНТ account_info
+    def audit(self, client_answer: str, context_text: str, account_info: str = "Нет данных") -> tuple[bool, str]:
+        prompt = AUDITOR_PROMPT.format(
+            context_text=context_text, 
+            client_answer=client_answer,
+            account_info=account_info
+        )
         logger.info(f"Проверка фактов через {self.model_name}...")
         
         payload = {
             "model": self.model_name,
             "prompt": prompt,
             "stream": False,
-            "options": {"temperature": 0.0, "num_ctx": 4096, "num_predict": 50} # Максимум 50 токенов!
+            "options": {"temperature": 0.1, "num_ctx": 4096, "num_predict": 200}
         }
         
         try:
             r = requests.post(self.ollama_url, json=payload, timeout=60)
             r.raise_for_status()
-            result = r.json().get("response", "").strip().upper()
+            result = r.json().get("response", "").strip()
             
-            # Жесткая проверка: если начинается с ГАЛЛЮЦИНАЦИЯ, значит брак
-            if result.startswith("ГАЛЛЮЦИНАЦИЯ"):
-                logger.warning(f"Найдена галлюцинация: {result}")
+            if "ГАЛЛЮЦИНАЦИЯ" in result.upper() or "НАРУШЕНИЕ" in result.upper():
+                logger.warning(f"Найдена ошибка: {result}")
                 return False, result
             return True, ""
         except Exception as e:

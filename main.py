@@ -36,7 +36,6 @@ class SupportSystem:
             "model": MODEL_NAME, "system": system_prompt, "prompt": user_prompt, "stream": False,
             "options": {"temperature": temperature, "num_ctx": 8192, "num_predict": 1000, "stop": ["<|im_end|>", "</s>", "[INST]"]},
         }
-
         try:
             r = requests.post(OLLAMA_URL, json=payload, timeout=120)
             r.raise_for_status()
@@ -46,32 +45,19 @@ class SupportSystem:
             return ""
 
     def _truncate_client_answer(self, text: str) -> str:
-        """Безжалостно вырезает списки, маркдаун и подписи, оставляя один абзац"""
         if not text: return ""
-        
-        # Убираем звездочки
         text = text.replace("**", "").replace("*", "")
-        
-        # Убираем подписи типа "С уважением"
         text = re.sub(r'(?i)с уважением.*', '', text)
-        
-        # Убираем списки (1. , 2) , - )
         text = re.sub(r'(?m)^\d+[\.\)]\s*', '', text)
         text = re.sub(r'(?m)^[-•]\s*', '', text)
-        
-        # Склеиваем все строки в один абзац
         text = " ".join([line.strip() for line in text.split('\n') if line.strip()])
-        
-        # Обрезаем, если больше 4 предложений
         sentences = re.split(r'(?<=[.!?]) +', text)
         if len(sentences) > 4:
             text = " ".join(sentences[:4])
-            if not text.endswith(('.', '!', '?')):
-                text += "..."
-                
+            if not text.endswith(('.', '!', '?')): text += "..."
         return text.strip()
 
-    def process_query(self, client_question: str):
+    def process_query(self, client_question: str, account_info: str = "Нет данных по счету.") -> tuple[str, str, str]:
         logger.info("Анализ запроса...")
         triage_result = self._ask_llm(prompts.TRIAGE_PROMPT + f"\n\nКлиент: {client_question}", temperature=0.1).strip()
         
@@ -80,7 +66,6 @@ class SupportSystem:
             return "УТОЧНЕНИЕ", clarify_text, "Клиент написал непонятно. Я переспросила."
 
         search_query_match = re.search(r'ЗАПРОС:\s*(.*)', triage_result)
-        
         if search_query_match:
             search_query = search_query_match.group(1).strip()
         else:
@@ -88,20 +73,21 @@ class SupportSystem:
             search_query = client_question
             
         logger.info(f"Поисковый запрос: {search_query}")
-
         context_text = self.rag.get_context(search_query)
 
         logger.info("Генерация ответа...")
         client_prompt = prompts.CLIENT_ANSWER_PROMPT.format(
-            tov_text=self.tov_text, context_text=context_text, emotion="нейтральный", client_question=client_question
+            tov_text=self.tov_text, context_text=context_text, 
+            emotion="нейтральный", client_question=client_question, account_info=account_info
         )
         client_answer = self._ask_llm(client_prompt, temperature=0.5)
-        client_answer = self._truncate_client_answer(client_answer) # ЖЕСТКАЯ ОБРЕЗКА
+        client_answer = self._truncate_client_answer(client_answer)
 
         # Self-Correction
         max_retries = 2
         for attempt in range(max_retries):
-            is_safe, feedback = self.auditor.audit(client_answer, context_text)
+            # ПЕРЕДАЕМ account_info В АУДИТОР!
+            is_safe, feedback = self.auditor.audit(client_answer, context_text, account_info)
             if is_safe:
                 logger.info("Аудитор одобрил ответ.")
                 break
@@ -112,16 +98,17 @@ class SupportSystem:
                 break
                 
             logger.info("Отправляем фидбек боту для переписывания...")
-            fix_prompt = prompts.FIX_PROMPT.format(feedback=feedback, client_answer=client_answer, context_text=context_text)
+            fix_prompt = prompts.FIX_PROMPT.format(feedback=feedback, client_answer=client_answer, context_text=context_text, account_info=account_info)
             client_answer = self._ask_llm(fix_prompt, temperature=0.3)
-            client_answer = self._truncate_client_answer(client_answer) # ОБРЕЗКА ПОСЛЕ ПЕРЕПИСЫВАНИЯ
+            client_answer = self._truncate_client_answer(client_answer)
 
         logger.info("Написание заметки для оператора...")
         op_prompt = prompts.OPERATOR_NOTE_PROMPT.format(
-            client_question=client_question, client_answer=client_answer, context_text=context_text
+            client_question=client_question, client_answer=client_answer, 
+            context_text=context_text, account_info=account_info
         )
         op_note = self._ask_llm(op_prompt, temperature=0.85).strip()
-        op_note = op_note.replace("**", "").replace("*", "") # Чистим заметку от звездочек
+        op_note = op_note.replace("**", "").replace("*", "")
 
         return search_query, client_answer, op_note
 
@@ -135,7 +122,12 @@ if __name__ == "__main__":
             if q.lower() in ["выход", "exit"]: 
                 break
             
-            query_or_flag, ans, note = system.process_query(q)
+            # НОВЫЙ ВВОД ДЛЯ CRM
+            acc_info = input("Инфо по счету из CRM (Enter, если пусто): ")
+            if not acc_info:
+                acc_info = "Арестов нет, ограничений нет, списаний не было."
+
+            query_or_flag, ans, note = system.process_query(q, acc_info)
             
             if query_or_flag == "УТОЧНЕНИЕ":
                 print(f"\n[Уточняющий вопрос]:\n{ans}")
@@ -145,7 +137,7 @@ if __name__ == "__main__":
             
             print(f"\n[Поисковый запрос]: {query_or_flag}")
             print(f"\n[Система] Луна ушла проверять базу...")
-            time.sleep(3)
+            time.sleep(2)
                 
             print(f"\n[Ответ клиенту]:")
             for char in ans:
