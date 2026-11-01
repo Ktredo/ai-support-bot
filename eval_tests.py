@@ -75,7 +75,7 @@ if __name__ == "__main__":
             tov_text=system.tov_text, context_text=context, emotion="нейтральный", client_question=q
         )
         raw_answer = system._ask_llm(prompt_text, temperature=0.5)
-        raw_answer = system._clean_text(raw_answer)
+        raw_answer = system._truncate_client_answer(raw_answer)
         eval_logger.info(f"[Сырой ответ бота]: {raw_answer}")
         
         # 3. Аудит

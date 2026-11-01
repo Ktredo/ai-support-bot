@@ -36,6 +36,7 @@ class SupportSystem:
             "model": MODEL_NAME, "system": system_prompt, "prompt": user_prompt, "stream": False,
             "options": {"temperature": temperature, "num_ctx": 8192, "num_predict": 1000, "stop": ["<|im_end|>", "</s>", "[INST]"]},
         }
+
         try:
             r = requests.post(OLLAMA_URL, json=payload, timeout=120)
             r.raise_for_status()
@@ -78,8 +79,14 @@ class SupportSystem:
             clarify_text = triage_result.split("УТОЧНИТЬ:")[1].strip()
             return "УТОЧНЕНИЕ", clarify_text, "Клиент написал непонятно. Я переспросила."
 
-        search_query = re.search(r'ЗАПРОС:\s*(.*)', triage_result)
-        search_query = search_query.group(1).strip() if search_query else client_question
+        search_query_match = re.search(r'ЗАПРОС:\s*(.*)', triage_result)
+        
+        if search_query_match:
+            search_query = search_query_match.group(1).strip()
+        else:
+            logger.warning("Triage не вернул ЗАПРОС. Используем исходный вопрос клиента.")
+            search_query = client_question
+            
         logger.info(f"Поисковый запрос: {search_query}")
 
         context_text = self.rag.get_context(search_query)
