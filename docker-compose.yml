@@ -1,0 +1,23 @@
+version: '3.8'
+
+services:
+  ollama:
+    image: ollama/ollama:latest
+    ports:
+      - "11434:11434"
+    volumes:
+      - ollama_data:/root/.ollama
+
+  bot:
+    build: .
+    depends_on:
+      - ollama
+    env_file:
+      - .env
+    volumes:
+      - ./pdfs:/app/pdfs
+      - ./knowledge_base:/app/knowledge_base
+      - ./qdrant_db:/app/qdrant_db
+
+volumes:
+  ollama_data:
