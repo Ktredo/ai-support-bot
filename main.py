@@ -8,6 +8,7 @@ from dotenv import load_dotenv
 from qdrant_rag import QdrantRAGEngine
 from auditor import FactAuditor
 import prompts
+from cachetools import TTLCache
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s | %(levelname)s | %(message)s', datefmt='%H:%M:%S')
 logger = logging.getLogger("Orchestrator")
@@ -21,6 +22,7 @@ class SupportSystem:
     def __init__(self):
         kb_path = os.path.abspath("knowledge_base.txt")
         self.rag = QdrantRAGEngine(kb_path)
+        self.sessions = TTLCache(maxsize=1000, ttl=300) 
         
         local_url = os.getenv("LOCAL_OLLAMA_URL", "http://127.0.0.1:11434/api/generate")
         auditor_model = os.getenv("AUDITOR_MODEL", "qwen2.5:7b")
@@ -30,6 +32,19 @@ class SupportSystem:
         if os.path.exists(TOV_FILE):
             with open(TOV_FILE, "r", encoding="utf-8") as f:
                 self.tov_text = f.read()
+
+    def get_memory(self, user_id: str):
+        if user_id not in self.sessions:
+            self.sessions[user_id] = []
+        return self.sessions[user_id]
+
+    def _add_to_memory(self, user_id: str, role: str, text: str):
+        mem = self.get_memory(user_id)
+        mem.append(f"{role}: {text}")
+        if len(mem) > 6:
+            mem = mem[-6:]
+        self.sessions[user_id] = mem # Обновляем кэш
+
 
     def _ask_llm(self, user_prompt: str, system_prompt: str = "Ты полезный ассистент.", temperature: float = 0.6) -> str:
         payload = {
@@ -57,12 +72,28 @@ class SupportSystem:
             if not text.endswith(('.', '!', '?')): text += "..."
         return text.strip()
 
-    def process_query(self, client_question: str, account_info: str = "Нет данных по счету.") -> tuple[str, str, str]:
-        logger.info("Анализ запроса...")
-        triage_result = self._ask_llm(prompts.TRIAGE_PROMPT + f"\n\nКлиент: {client_question}", temperature=0.1).strip()
+    # 1. ДОБАВЛЯЕМ user_id В АРГУМЕНТЫ
+    def process_query(self, user_id: str, client_question: str, account_info: str = "Нет данных по счету.") -> tuple[str, str, str]:
+        logger.info(f"Анализ запроса от {user_id}...")
+        
+        # 2. ДОСТАЕМ ИСТОРИЮ ЭТОГО КЛИЕНТА
+        history_text = "\n".join(self.get_memory(user_id))
+        if not history_text:
+            history_text = "История диалога пуста."
+
+        # 3. ПЕРЕДАЕМ ИСТОРИЮ В TRIAGE
+        triage_prompt = prompts.TRIAGE_PROMPT.format(
+            history=history_text,
+            client_question=client_question,
+            account_info=account_info
+        )
+        triage_result = self._ask_llm(triage_prompt, temperature=0.2).strip()
         
         if "УТОЧНИТЬ:" in triage_result:
             clarify_text = triage_result.split("УТОЧНИТЬ:")[1].strip()
+            # Сохраняем вопрос и уточнение в память
+            self._add_to_memory(user_id, "Клиент", client_question)
+            self._add_to_memory(user_id, "Ты", clarify_text)
             return "УТОЧНЕНИЕ", clarify_text, "Клиент написал непонятно. Я переспросила."
 
         search_query_match = re.search(r'ЗАПРОС:\s*(.*)', triage_result)
@@ -86,7 +117,6 @@ class SupportSystem:
         # Self-Correction
         max_retries = 2
         for attempt in range(max_retries):
-            # ПЕРЕДАЕМ account_info В АУДИТОР!
             is_safe, feedback = self.auditor.audit(client_answer, context_text, account_info)
             if is_safe:
                 logger.info("Аудитор одобрил ответ.")
@@ -101,6 +131,10 @@ class SupportSystem:
             fix_prompt = prompts.FIX_PROMPT.format(feedback=feedback, client_answer=client_answer, context_text=context_text, account_info=account_info)
             client_answer = self._ask_llm(fix_prompt, temperature=0.3)
             client_answer = self._truncate_client_answer(client_answer)
+
+        # 4. СОХРАНЯЕМ ДИАЛОГ В ПАМЯТЬ
+        self._add_to_memory(user_id, "Клиент", client_question)
+        self._add_to_memory(user_id, "Ты", client_answer)
 
         logger.info("Написание заметки для оператора...")
         op_prompt = prompts.OPERATOR_NOTE_PROMPT.format(
@@ -118,16 +152,18 @@ if __name__ == "__main__":
     
     while True:
         try:
-            q = input("\nКлиент: ")
-            if q.lower() in ["выход", "exit"]: 
+            # СПРАШИВАЕМ ID КЛИЕНТА
+            user_id = input("\nВведите ID клиента (например, 123): ")
+            if user_id.lower() in ["выход", "exit"]: 
                 break
             
-            # НОВЫЙ ВВОД ДЛЯ CRM
+            q = input("Клиент: ")
             acc_info = input("Инфо по счету из CRM (Enter, если пусто): ")
             if not acc_info:
                 acc_info = "Арестов нет, ограничений нет, списаний не было."
 
-            query_or_flag, ans, note = system.process_query(q, acc_info)
+            # ПЕРЕДАЕМ ID В ФУНКЦИЮ
+            query_or_flag, ans, note = system.process_query(user_id, q, acc_info)
             
             if query_or_flag == "УТОЧНЕНИЕ":
                 print(f"\n[Уточняющий вопрос]:\n{ans}")
