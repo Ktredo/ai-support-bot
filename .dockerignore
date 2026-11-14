@@ -1,0 +1,29 @@
+# Секреты и локальное окружение
+.env
+.venv/
+.pydeps/
+.tmp/
+
+# Git и служебные файлы
+.git/
+.gitignore
+.gitattributes
+
+# Кэши Python
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# Локальные данные и артефакты: монтируются volume-ом, в образ не нужны
+qdrant_db/
+pdfs/
+screenshots/
+knowledge_base/
+*.log
+
+# Мусор IDE/OS
+.idea/
+.vscode/
+.DS_Store

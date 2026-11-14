@@ -16,6 +16,20 @@ eval_results.log
 # Данные (PDF-файлы могут нарушать авторские права, поэтому в репо их не кладем)
 pdfs/
 
+# Остатки от парсинга PDF: код их не читает (база знаний — knowledge_base.txt)
+knowledge_base/
+
+# Локальные скриншоты для демо
+screenshots/
+
+# Локальное окружение и кэши тестов
+.venv/
+.pydeps/
+.tmp/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
 # Системный мусор
 .DS_Store
 .idea/

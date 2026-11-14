@@ -8,6 +8,7 @@ from dotenv import load_dotenv
 from qdrant_rag import QdrantRAGEngine
 from auditor import FactAuditor
 import prompts
+from textutils import truncate_client_answer
 from cachetools import TTLCache
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s | %(levelname)s | %(message)s', datefmt='%H:%M:%S')
@@ -16,22 +17,16 @@ logger = logging.getLogger("Orchestrator")
 load_dotenv()
 OLLAMA_URL = os.getenv("OLLAMA_URL")
 MODEL_NAME = os.getenv("MODEL_NAME")
-TOV_FILE = "knowledge_base/tov_rules.md"
 
 class SupportSystem:
     def __init__(self):
         kb_path = os.path.abspath("knowledge_base.txt")
         self.rag = QdrantRAGEngine(kb_path)
-        self.sessions = TTLCache(maxsize=1000, ttl=300) 
-        
+        self.sessions = TTLCache(maxsize=1000, ttl=300)
+
         local_url = os.getenv("LOCAL_OLLAMA_URL", "http://127.0.0.1:11434/api/generate")
         auditor_model = os.getenv("AUDITOR_MODEL", "qwen2.5:7b")
         self.auditor = FactAuditor(local_url, auditor_model)
-        
-        self.tov_text = "Правила ToV не найдены."
-        if os.path.exists(TOV_FILE):
-            with open(TOV_FILE, "r", encoding="utf-8") as f:
-                self.tov_text = f.read()
 
     def get_memory(self, user_id: str):
         if user_id not in self.sessions:
@@ -43,8 +38,7 @@ class SupportSystem:
         mem.append(f"{role}: {text}")
         if len(mem) > 6:
             mem = mem[-6:]
-        self.sessions[user_id] = mem # Обновляем кэш
-
+        self.sessions[user_id] = mem
 
     def _ask_llm(self, user_prompt: str, system_prompt: str = "Ты полезный ассистент.", temperature: float = 0.6) -> str:
         payload = {
@@ -59,132 +53,136 @@ class SupportSystem:
             logger.error(f"Ошибка API: {e}")
             return ""
 
-    def _truncate_client_answer(self, text: str) -> str:
-        if not text: return ""
-        text = text.replace("**", "").replace("*", "")
-        text = re.sub(r'(?i)с уважением.*', '', text)
-        text = re.sub(r'(?m)^\d+[\.\)]\s*', '', text)
-        text = re.sub(r'(?m)^[-•]\s*', '', text)
-        text = " ".join([line.strip() for line in text.split('\n') if line.strip()])
-        sentences = re.split(r'(?<=[.!?]) +', text)
-        if len(sentences) > 4:
-            text = " ".join(sentences[:4])
-            if not text.endswith(('.', '!', '?')): text += "..."
-        return text.strip()
+    def _truncate_client_answer(self, text: str, mode: str) -> str:
+        """Обертка для обратной совместимости: логика живет в textutils."""
+        return truncate_client_answer(text, mode)
 
-    # 1. ДОБАВЛЯЕМ user_id В АРГУМЕНТЫ
-    def process_query(self, user_id: str, client_question: str, account_info: str = "Нет данных по счету.") -> tuple[str, str, str]:
-        logger.info(f"Анализ запроса от {user_id}...")
-        
-        # 2. ДОСТАЕМ ИСТОРИЮ ЭТОГО КЛИЕНТА
+    def process_query(self, user_id: str, mode: str, client_question: str, account_info: str = "Нет данных") -> tuple[str, str, str]:
+        """Triage -> RAG -> генерация -> самопроверка.
+
+        Возвращает (поисковый запрос, ответ клиенту, заметку оператору).
+        """
+        logger.info(f"Анализ запроса от {user_id} (Режим: {mode})...")
+
         history_text = "\n".join(self.get_memory(user_id))
-        if not history_text:
-            history_text = "История диалога пуста."
+        if not history_text: history_text = "История пуста."
 
-        # 3. ПЕРЕДАЕМ ИСТОРИЮ В TRIAGE
-        triage_prompt = prompts.TRIAGE_PROMPT.format(
-            history=history_text,
-            client_question=client_question,
-            account_info=account_info
-        )
-        triage_result = self._ask_llm(triage_prompt, temperature=0.2).strip()
-        
-        if "УТОЧНИТЬ:" in triage_result:
-            clarify_text = triage_result.split("УТОЧНИТЬ:")[1].strip()
-            # Сохраняем вопрос и уточнение в память
-            self._add_to_memory(user_id, "Клиент", client_question)
-            self._add_to_memory(user_id, "Ты", clarify_text)
-            return "УТОЧНЕНИЕ", clarify_text, "Клиент написал непонятно. Я переспросила."
+        mode_data = prompts.MODES[mode]
+
+        # 1. Triage
+        triage_prompt = f"""Ты работаешь в пиццерии.
+{mode_data['triage_instruction']}
+История: {history_text}
+CRM: {account_info}
+Вопрос: {client_question}
+
+Ответь СТРОГО в формате:
+ЗАПРОС: [суть вопроса]
+"""
+        triage_result = self._ask_llm(triage_prompt, temperature=0.1).strip()
 
         search_query_match = re.search(r'ЗАПРОС:\s*(.*)', triage_result)
-        if search_query_match:
-            search_query = search_query_match.group(1).strip()
-        else:
-            logger.warning("Triage не вернул ЗАПРОС. Используем исходный вопрос клиента.")
-            search_query = client_question
-            
+        search_query = search_query_match.group(1).strip() if search_query_match else client_question
+
         logger.info(f"Поисковый запрос: {search_query}")
         context_text = self.rag.get_context(search_query)
 
+        # 2. Генерация
         logger.info("Генерация ответа...")
-        client_prompt = prompts.CLIENT_ANSWER_PROMPT.format(
-            tov_text=self.tov_text, context_text=context_text, 
-            emotion="нейтральный", client_question=client_question, account_info=account_info
-        )
-        client_answer = self._ask_llm(client_prompt, temperature=0.5)
-        client_answer = self._truncate_client_answer(client_answer)
+        client_prompt = f"""{mode_data['client_instruction']}
+ToV: {mode_data['tov']}
+Контекст: {context_text}
+CRM: {account_info}
+Вопрос: {client_question}
 
-        # Self-Correction
+Твой ответ:"""
+        client_answer = self._ask_llm(client_prompt, temperature=0.5)
+        client_answer = self._truncate_client_answer(client_answer, mode)
+
+        # 3. Self-Correction
         max_retries = 2
         for attempt in range(max_retries):
-            is_safe, feedback = self.auditor.audit(client_answer, context_text, account_info)
+            is_safe, feedback = self.auditor.audit(client_answer, context_text)
             if is_safe:
-                logger.info("Аудитор одобрил ответ.")
                 break
-                
+
             logger.warning(f"Аудитор забраковал (Попытка {attempt+1}): {feedback}")
             if attempt == max_retries - 1:
-                client_answer = "Я уточню информацию по вашему вопросу и вернусь с ответом."
+                client_answer = "Я уточню информацию и вернусь с ответом."
                 break
-                
-            logger.info("Отправляем фидбек боту для переписывания...")
-            fix_prompt = prompts.FIX_PROMPT.format(feedback=feedback, client_answer=client_answer, context_text=context_text, account_info=account_info)
-            client_answer = self._ask_llm(fix_prompt, temperature=0.3)
-            client_answer = self._truncate_client_answer(client_answer)
 
-        # 4. СОХРАНЯЕМ ДИАЛОГ В ПАМЯТЬ
+            fix_prompt = f"""Ты написала ответ, но аудитор забраковал его.
+Ошибка: {feedback}
+Старый ответ: {client_answer}
+База: {context_text}
+
+Перепиши ответ, используя ТОЛЬКО факты из базы (2-3 предложения)."""
+            client_answer = self._ask_llm(fix_prompt, temperature=0.3)
+            client_answer = self._truncate_client_answer(client_answer, mode)
+
         self._add_to_memory(user_id, "Клиент", client_question)
         self._add_to_memory(user_id, "Ты", client_answer)
 
-        logger.info("Написание заметки для оператора...")
-        op_prompt = prompts.OPERATOR_NOTE_PROMPT.format(
-            client_question=client_question, client_answer=client_answer, 
-            context_text=context_text, account_info=account_info
+        # 4. Заметка оператору
+        op_prompt = f"""{mode_data['operator_note']}
+        """.format(
+            client_question=client_question,
+            client_answer=client_answer,
+            context_text=context_text,
+            account_info=account_info
         )
+
         op_note = self._ask_llm(op_prompt, temperature=0.85).strip()
         op_note = op_note.replace("**", "").replace("*", "")
 
         return search_query, client_answer, op_note
 
+
 if __name__ == "__main__":
     system = SupportSystem()
-    logger.info("=== СИСТЕМА ГОТОВА ===")
-    
+    current_mode = "bank_support" # По умолчанию банк
+
+    logger.info(f"=== СИСТЕМА ГОТОВА (Режим: {prompts.MODES[current_mode]['name']}) ===")
+    logger.info("Доступные режимы: " + ", ".join(f"/mode {key}" for key in prompts.MODES))
+
     while True:
         try:
-            # СПРАШИВАЕМ ID КЛИЕНТА
-            user_id = input("\nВведите ID клиента (например, 123): ")
-            if user_id.lower() in ["выход", "exit"]: 
-                break
-            
-            q = input("Клиент: ")
-            acc_info = input("Инфо по счету из CRM (Enter, если пусто): ")
-            if not acc_info:
-                acc_info = "Арестов нет, ограничений нет, списаний не было."
+            user_id = input("\nВведите ID клиента (Enter - 123): ") or "123"
+            if user_id.lower() in ["выход", "exit"]: break
 
-            # ПЕРЕДАЕМ ID В ФУНКЦИЮ
-            query_or_flag, ans, note = system.process_query(user_id, q, acc_info)
-            
-            if query_or_flag == "УТОЧНЕНИЕ":
-                print(f"\n[Уточняющий вопрос]:\n{ans}")
-                print(f"\n[Заметка для тебя]:\n{note}")
-                print("-" * 50)
+            q = input(f"Клиент [{prompts.MODES[current_mode]['name']}]: ")
+
+            # Проверяем смену режима
+            if q.startswith("/mode "):
+                new_mode = q.split(" ")[1].strip()
+                if new_mode in prompts.MODES:
+                    current_mode = new_mode
+                    print(f"\n[Система] Режим переключен на: {prompts.MODES[current_mode]['name']}")
+                else:
+                    print(f"\n[Система] Неизвестный режим. Доступно: {', '.join(prompts.MODES.keys())}")
                 continue
-            
+
+            if q.lower() in ["выход", "exit"]: break
+
+            acc_info = input("Доп. инфо (Enter, если пусто): ")
+            if not acc_info: acc_info = "Нет данных."
+
+            query_or_flag, ans, note = system.process_query(user_id, current_mode, q, acc_info)
+
             print(f"\n[Поисковый запрос]: {query_or_flag}")
-            print(f"\n[Система] Луна ушла проверять базу...")
-            time.sleep(2)
-                
-            print(f"\n[Ответ клиенту]:")
+            print(f"\n[Система] Бот ищет ответ...")
+            time.sleep(1)
+
+            print(f"\n[Ответ]:")
             for char in ans:
                 print(char, end="", flush=True)
-                time.sleep(0.015)
-            print() 
-            
+                time.sleep(0.01)
+            print()
+
             print(f"\n[Заметка для тебя]:\n{note}")
             print("-" * 50)
-            
+
         except KeyboardInterrupt:
             break
         except Exception as e:
-            logger.error(f"Критическая ошибка в цикле: {e}")
+            logger.error(f"Критическая ошибка: {e}")
